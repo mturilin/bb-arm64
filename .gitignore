@@ -1,0 +1,3 @@
+*.AppImage
+*.blockmap
+.DS_Store

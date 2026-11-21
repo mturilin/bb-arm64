@@ -1,0 +1,236 @@
+# What: GitHub Actions workflow that tracks get-bb/bb releases and builds self-updating Linux ARM64 AppImages.
+# Why: Upstream get-bb/bb only publishes x86_64 AppImages for Linux; ARM64 Linux users have no native AppImage or in-app auto-updater.
+# Design notes:
+#   - Uses a fast ubuntu-latest check job before spinning up ubuntu-22.04-arm (glibc 2.35 baseline for broad distro compatibility).
+#   - Rewrites upstream's update release base URL in desktop-update-provider.ts and desktop-release-channel.mjs to this repository so
+#     electron-updater's in-app self-update works against our rolling desktop-latest release.
+#   - Mirrors latest-linux-arm64.yml <-> latest-linux.yml so both electron-updater (ARM64) and bb's desktop:version-feed work.
+# Gotchas:
+#   - ubuntu-22.04-arm is free only on public repositories.
+#   - Because actions/checkout checks out get-bb/bb, every `gh release` call MUST pass `--repo "${{ github.repository }}"` and `--target main`.
+#   - Upstream file structure changes in apps/desktop may require updating the patch step; it fails fast if a replacement has no effect.
+
+name: Build bb ARM64 AppImage
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Specific bb version to build (e.g. 0.50.1). Leave blank for latest upstream."
+        required: false
+        default: ""
+      force:
+        description: "Rebuild and republish even if this version already exists here"
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-bb-arm64
+  cancel-in-progress: false
+
+env:
+  NODE_VERSION: "22.x"
+  PNPM_VERSION: "9.15.0"
+  CSC_IDENTITY_AUTO_DISCOVERY: "false"
+
+jobs:
+  check:
+    name: Check upstream bb release
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.check.outputs.should_build }}
+      tag: ${{ steps.check.outputs.tag }}
+      version: ${{ steps.check.outputs.version }}
+
+    steps:
+      - name: Determine target version
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+
+          if [[ -n "$INPUT_VERSION" ]]; then
+            version="${INPUT_VERSION#desktop-v}"
+            version="${version#v}"
+            tag="desktop-v${version}"
+          else
+            tag=$(curl -fsSL "https://api.github.com/repos/get-bb/bb/releases?per_page=30" |
+              jq -r '[.[] | select(.draft | not) | select(.prerelease | not) | .tag_name | select(test("^desktop-v[0-9]+\\.[0-9]+\\.[0-9]+$"))][0] // empty')
+            if [[ -z "$tag" ]]; then
+              echo "::error::Could not resolve latest stable desktop-v* release from get-bb/bb."
+              exit 1
+            fi
+            version="${tag#desktop-v}"
+          fi
+
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+          if [[ "$INPUT_FORCE" == "true" ]]; then
+            echo "Force rebuild requested for ${tag}."
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if gh release view "$tag" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "Release ${tag} already published in ${{ github.repository }}; skipping build."
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "New upstream release ${tag} detected; scheduling ARM64 build."
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    name: Build & publish Linux ARM64 AppImage (${{ needs.check.outputs.version }})
+    needs: check
+    if: needs.check.outputs.should_build == 'true'
+    runs-on: ubuntu-22.04-arm
+    timeout-minutes: 45
+
+    steps:
+      - name: Verify ARM64 runner
+        run: |
+          uname -a
+          test "$(uname -m)" = "aarch64"
+
+      - name: Checkout upstream get-bb/bb
+        uses: actions/checkout@v4
+        with:
+          repository: get-bb/bb
+          ref: ${{ needs.check.outputs.tag }}
+          fetch-depth: 1
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+          run_install: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile --prefer-offline
+
+      - name: Patch update feed URL and ARM64 AppImage target
+        env:
+          TARGET_REPO: ${{ github.repository }}
+        run: |
+          node <<'EOF'
+          const fs = require("node:fs");
+
+          const targetRepo = process.env.TARGET_REPO;
+          if (!targetRepo) {
+            throw new Error("TARGET_REPO is empty");
+          }
+
+          function replaceOrThrow(filePath, search, replacement) {
+            const content = fs.readFileSync(filePath, "utf8");
+            if (!content.includes(search)) {
+              throw new Error(`Expected string not found in ${filePath}: ${search}`);
+            }
+            fs.writeFileSync(filePath, content.replaceAll(search, replacement));
+          }
+
+          const upstreamPrefix = "https://github.com/get-bb/bb/releases/download/";
+          const mirrorPrefix = `https://github.com/${targetRepo}/releases/download/`;
+
+          replaceOrThrow(
+            "apps/desktop/src/desktop-update-provider.ts",
+            upstreamPrefix,
+            mirrorPrefix,
+          );
+          replaceOrThrow(
+            "apps/desktop/scripts/desktop-release-channel.mjs",
+            upstreamPrefix,
+            mirrorPrefix,
+          );
+
+          const ebConfigPath = "apps/desktop/electron-builder.config.json";
+          const ebConfig = JSON.parse(fs.readFileSync(ebConfigPath, "utf8"));
+          ebConfig.linux = {
+            ...ebConfig.linux,
+            target: [{ target: "AppImage", arch: ["arm64"] }],
+          };
+          fs.writeFileSync(ebConfigPath, `${JSON.stringify(ebConfig, null, 2)}\n`);
+          console.log(`Patched update URLs to ${mirrorPrefix} and Linux target to arm64 AppImage.`);
+          EOF
+
+      - name: Build @bb/desktop
+        run: pnpm exec turbo run build --filter=@bb/desktop --output-logs=new-only
+
+      - name: Package ARM64 AppImage
+        run: |
+          cd apps/desktop
+          node scripts/run-electron-builder.mjs --linux AppImage --arm64 --publish never
+
+      - name: Prepare update metadata and version feed
+        run: |
+          set -euo pipefail
+          ls -la apps/desktop/release/
+
+          if [[ -f apps/desktop/release/latest-linux-arm64.yml && ! -f apps/desktop/release/latest-linux.yml ]]; then
+            cp apps/desktop/release/latest-linux-arm64.yml apps/desktop/release/latest-linux.yml
+          elif [[ -f apps/desktop/release/latest-linux.yml && ! -f apps/desktop/release/latest-linux-arm64.yml ]]; then
+            cp apps/desktop/release/latest-linux.yml apps/desktop/release/latest-linux-arm64.yml
+          fi
+
+          pnpm --dir apps/desktop run desktop:version-feed
+          ls -la apps/desktop/release/
+
+      - name: Publish versioned and rolling desktop-latest releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.check.outputs.tag }}
+          VERSION: ${{ needs.check.outputs.version }}
+          TARGET_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          shopt -s nullglob
+          ASSETS=(
+            apps/desktop/release/*.AppImage
+            apps/desktop/release/*.blockmap
+            apps/desktop/release/latest-linux-arm64.yml
+            apps/desktop/release/latest-linux.yml
+            apps/desktop/release/desktop-version-linux.json
+          )
+
+          if (( ${#ASSETS[@]} < 4 )); then
+            echo "::error::Expected AppImage, blockmap, yml, and version feed assets; got: ${ASSETS[*]}"
+            exit 1
+          fi
+
+          NOTES="Unofficial Linux ARM64 AppImage build of [get-bb/bb ${TAG}](https://github.com/get-bb/bb/releases/tag/${TAG}), configured for in-app auto-updates from \`${TARGET_REPO}\`."
+
+          if gh release view "$TAG" --repo "$TARGET_REPO" >/dev/null 2>&1; then
+            gh release upload "$TAG" "${ASSETS[@]}" --repo "$TARGET_REPO" --clobber
+          else
+            gh release create "$TAG" "${ASSETS[@]}" \
+              --repo "$TARGET_REPO" \
+              --target main \
+              --title "bb ${VERSION} (Linux ARM64)" \
+              --notes "$NOTES"
+          fi
+
+          # Recreate rolling desktop-latest so stale version AppImages are never left behind.
+          if gh release view desktop-latest --repo "$TARGET_REPO" >/dev/null 2>&1; then
+            gh release delete desktop-latest --repo "$TARGET_REPO" --yes --cleanup-tag
+          fi
+          gh release create desktop-latest "${ASSETS[@]}" \
+            --repo "$TARGET_REPO" \
+            --target main \
+            --title "bb Latest (Linux ARM64 — ${VERSION})" \
+            --notes "$NOTES"
