@@ -30,6 +30,9 @@ refresh_caches() {
   if command -v gtk-update-icon-cache >/dev/null 2>&1 && [[ -d "$ICON_ROOT" ]]; then
     gtk-update-icon-cache -f "$ICON_ROOT" >/dev/null 2>&1 || true
   fi
+  if command -v kbuildsycoca6 >/dev/null 2>&1; then
+    kbuildsycoca6 >/dev/null 2>&1 || true
+  fi
 }
 
 uninstall_bb() {
@@ -102,10 +105,13 @@ echo "Extracting desktop entry and icons..."
 )
 
 installed_icon=false
+rm -f "${ICON_ROOT}/1024x1024/apps/bb.png"
 shopt -s nullglob
 for icon in "$work"/squashfs-root/usr/share/icons/hicolor/*/apps/*.png; do
   rel="${icon#"$work/squashfs-root/usr/share/icons/hicolor/"}"
   size="${rel%%/*}"
+  # hicolor's index.theme tops out at 512x512; 1024x1024 is ignored by KDE/KRunner.
+  [[ "$size" == "1024x1024" ]] && size="512x512"
   install -Dm644 "$icon" "${ICON_ROOT}/${size}/apps/bb.png"
   installed_icon=true
 done
